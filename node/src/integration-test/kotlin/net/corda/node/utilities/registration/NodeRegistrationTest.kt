@@ -6,7 +6,10 @@ import net.corda.core.internal.cert
 import net.corda.core.internal.concurrent.transpose
 import net.corda.core.internal.toX509CertHolder
 import net.corda.core.messaging.startFlow
-import net.corda.core.utilities.*
+import net.corda.core.utilities.NetworkHostAndPort
+import net.corda.core.utilities.OpaqueBytes
+import net.corda.core.utilities.getOrThrow
+import net.corda.core.utilities.minutes
 import net.corda.finance.DOLLARS
 import net.corda.finance.flows.CashIssueAndPaymentFlow
 import net.corda.nodeapi.internal.crypto.CertificateAndKeyPair
@@ -16,7 +19,6 @@ import net.corda.nodeapi.internal.crypto.X509Utilities
 import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_CLIENT_CA
 import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_INTERMEDIATE_CA
 import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_ROOT_CA
-import net.corda.nodeapi.internal.network.NotaryInfo
 import net.corda.testing.ROOT_CA
 import net.corda.testing.SerializationEnvironmentRule
 import net.corda.testing.driver.PortAllocation
@@ -25,7 +27,6 @@ import net.corda.testing.node.internal.CompatibilityZoneParams
 import net.corda.testing.node.internal.internalDriver
 import net.corda.testing.node.internal.network.NetworkMapServer
 import net.corda.testing.singleIdentity
-import net.corda.testing.singleIdentityAndCert
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.bouncycastle.pkcs.PKCS10CertificationRequest
@@ -73,40 +74,41 @@ class NodeRegistrationTest {
                 portAllocation = portAllocation,
                 compatibilityZone = compatibilityZone,
                 initialiseSerialization = false,
-                notarySpecs = listOf(NotarySpec(CordaX500Name(organisation = "NotaryService", locality = "Zurich", country = "CH"), validating = false)),
+                notarySpecs = listOf(NotarySpec(CordaX500Name("NotaryService", "Zurich", "CH"), validating = false)),
                 extraCordappPackagesToScan = listOf("net.corda.finance"),
                 onNetworkParametersGeneration = { server.networkParameters = it }
         ) {
-            val notary = defaultNotaryNode.get()
+            val aliceName = "Alice"
+            val genevieveName = "Genevieve"
 
-            val ALICE_NAME = "Alice"
-            val GENEVIEVE_NAME = "Genevieve"
-            val nodesFutures = listOf(startNode(providedName = CordaX500Name(ALICE_NAME, "London", "GB")),
-                    startNode(providedName = CordaX500Name(GENEVIEVE_NAME, "London", "GB")))
+            val nodes = listOf(
+                    startNode(providedName = CordaX500Name(aliceName, "London", "GB")),
+                    startNode(providedName = CordaX500Name(genevieveName, "London", "GB")),
+                    defaultNotaryNode
+            ).transpose().getOrThrow()
+            val (alice, genevieve) = nodes
 
-            val (alice, genevieve) = nodesFutures.transpose().get()
-            val nodes = listOf(alice, genevieve, notary)
-
-            assertThat(registrationHandler.idsPolled).contains(ALICE_NAME, GENEVIEVE_NAME)
+            assertThat(registrationHandler.idsPolled).contains(aliceName, genevieveName)
             // Notary identities are generated beforehand hence notary nodes don't go through registration.
             // This test isn't specifically testing this, or relying on this behavior, though if this check fail,
             // this will probably lead to the rest of the test to fail.
             assertThat(registrationHandler.idsPolled).doesNotContain("NotaryService")
 
             // Check each node has each other identity in their network map cache.
-            val nodeIdentities = nodes.map { it.nodeInfo.singleIdentity() }
             for (node in nodes) {
-                assertThat(node.rpc.networkMapSnapshot().map { it.singleIdentity() }).containsAll(nodeIdentities)
+                assertThat(node.rpc.networkMapSnapshot()).containsOnlyElementsOf(nodes.map { it.nodeInfo })
             }
 
             // Check we nodes communicate among themselves (and the notary).
             val anonymous = false
-            genevieve.rpc.startFlow(::CashIssueAndPaymentFlow, 1000.DOLLARS, OpaqueBytes.of(12),
+            genevieve.rpc.startFlow(
+                    ::CashIssueAndPaymentFlow,
+                    1000.DOLLARS,
+                    OpaqueBytes.of(12),
                     alice.nodeInfo.singleIdentity(),
                     anonymous,
-                    notary.nodeInfo.singleIdentity())
-                    .returnValue
-                    .getOrThrow()
+                    defaultNotaryIdentity
+            ).returnValue.getOrThrow()
         }
     }
 
@@ -119,8 +121,7 @@ class NodeRegistrationTest {
                 notarySpecs = emptyList(),
                 compatibilityZone = compatibilityZone,
                 initialiseSerialization = false,
-                // Changing the content of the truststore makes the node fail in a number of ways if started out process.
-                startNodesInProcess = true
+                startNodesInProcess = true  // We need to run the nodes in the same process so that we can capture the correct exception
         ) {
             assertThatThrownBy {
                 startNode(providedName = CordaX500Name("Alice", "London", "GB")).getOrThrow()
